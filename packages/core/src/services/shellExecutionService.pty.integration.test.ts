@@ -21,9 +21,21 @@ describe.runIf(shouldRun)(
   'ShellExecutionService PTY fd leak integration',
   () => {
     it('does not leak slave fds across rapid PTY executions', async () => {
-      const getOpenFdCount = (): number => {
+      const getOpenPtyCount = (): number => {
         try {
-          return fsSync.readdirSync('/dev/fd').length;
+          return fsSync.readdirSync('/dev/fd').filter((fdStr) => {
+            try {
+              const stat = fsSync.fstatSync(Number(fdStr));
+              if (!stat.isCharacterDevice()) {
+                return false;
+              }
+              const major = (stat.rdev >> 24) & 0xff;
+              // On Darwin, major 15 is /dev/ptmx and 16 is /dev/ttys*
+              return major === 15 || major === 16;
+            } catch {
+              return false;
+            }
+          }).length;
         } catch {
           return 0;
         }
@@ -31,7 +43,7 @@ describe.runIf(shouldRun)(
 
       const baselineSamples: number[] = [];
       for (let i = 0; i < PTY_BASELINE_FD_PROBE_COUNT; i++) {
-        baselineSamples.push(getOpenFdCount());
+        baselineSamples.push(getOpenPtyCount());
       }
       const baseline = Math.max(...baselineSamples);
 
@@ -55,8 +67,54 @@ describe.runIf(shouldRun)(
         await handle.result;
       }
 
-      const finalCount = getOpenFdCount();
-      expect(finalCount - baseline).toBeLessThan(PTY_ITERATIONS);
+      const finalCount = getOpenPtyCount();
+      expect(finalCount - baseline).toBe(0);
     }, 120000);
+
+    it('does not leak master ptmx descriptors across PTY executions', async () => {
+      if (os.platform() !== 'darwin') {
+        return;
+      }
+
+      const { spawnSync } = await import('node:child_process');
+      const getPtmxCount = (): number => {
+        try {
+          return spawnSync(
+            'lsof',
+            ['-nP', '-a', '-p', String(process.pid), '/dev/ptmx'],
+            { encoding: 'utf8' },
+          )
+            .stdout.split('\n')
+            .filter((x: string) => x.includes('/dev/ptmx')).length;
+        } catch {
+          return 0;
+        }
+      };
+
+      const baseline = getPtmxCount();
+
+      for (let i = 0; i < 8; i++) {
+        const handle = await ShellExecutionService.execute(
+          'printf pty-probe',
+          process.cwd(),
+          () => {},
+          new AbortController().signal,
+          true,
+          {
+            sanitizationConfig: {
+              enableEnvironmentVariableRedaction: false,
+              allowedEnvironmentVariables: [],
+              blockedEnvironmentVariables: [],
+            },
+            sandboxManager: new NoopSandboxManager(),
+            sessionId: 'integration',
+          },
+        );
+        await handle.result;
+      }
+
+      const finalCount = getPtmxCount();
+      expect(finalCount - baseline).toBe(0);
+    }, 60000);
   },
 );

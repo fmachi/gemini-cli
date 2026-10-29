@@ -1045,6 +1045,85 @@ export class ShellExecutionService {
   }
 
   /**
+   * Synchronously closes the orphan master PTY file descriptor leaked in the
+   * parent process by @lydell/node-pty on macOS (darwin).
+   *
+   * In node-pty <= 1.1.0 on macOS, `pty_posix_spawn` includes a low-FD protection
+   * loop that opens temporary PTY master descriptors via `posix_openpt(O_RDWR)`
+   * into `low_fds[3]` to ensure `*master` is above STDERR_FILENO.
+   * Due to an off-by-one bug in the native cleanup loop (`for (; count > 0; count--)`),
+   * `low_fds[0]` is never closed when count is 0 (the standard case when FDs 0-2 are
+   * already open), permanently leaking one /dev/ptmx descriptor per spawn and
+   * leading to system-wide PTY exhaustion (openpty: Device not configured / ENXIO).
+   *
+   * Because `low_fds[0]` is opened immediately prior to `*master`, its descriptor
+   * number is `masterFd - 1`. Closing it synchronously at spawn time on the same
+   * JS tick releases the kernel PTY slot safely without any risk of descriptor reuse.
+   */
+  private static closeOrphanMasterFd(
+    masterFd: number | undefined,
+  ): number | undefined {
+    if (os.platform() !== 'darwin') {
+      return undefined;
+    }
+    if (
+      typeof masterFd !== 'number' ||
+      !Number.isFinite(masterFd) ||
+      masterFd <= 0
+    ) {
+      return undefined;
+    }
+
+    const candidateFd = masterFd - 1;
+
+    try {
+      const masterStat = fs.fstatSync(masterFd);
+      if (
+        typeof masterStat.isCharacterDevice !== 'function' ||
+        !masterStat.isCharacterDevice()
+      ) {
+        return undefined;
+      }
+
+      const candidateStat = fs.fstatSync(candidateFd);
+      if (
+        typeof candidateStat.isCharacterDevice !== 'function' ||
+        !candidateStat.isCharacterDevice()
+      ) {
+        return undefined;
+      }
+
+      // Ensure both descriptors reside on the devfs device
+      if (candidateStat.dev !== masterStat.dev) {
+        return undefined;
+      }
+
+      // On Darwin, /dev/ptmx has major device number 15.
+      // Verify both candidateFd and masterFd share the ptmx major device number.
+      const DARWIN_PTMX_MAJOR = 15;
+      const candidateMajor = (candidateStat.rdev >> 24) & 0xff;
+      const masterMajor = (masterStat.rdev >> 24) & 0xff;
+
+      if (
+        candidateMajor !== DARWIN_PTMX_MAJOR ||
+        masterMajor !== DARWIN_PTMX_MAJOR
+      ) {
+        return undefined;
+      }
+
+      // Ensure candidateFd is a distinct master instance (different minor number)
+      if (candidateStat.rdev === masterStat.rdev) {
+        return undefined;
+      }
+
+      fs.closeSync(candidateFd);
+      return candidateFd;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Synchronously closes the orphan slave PTY file descriptor leaked in the
    * parent process by @lydell/node-pty on macOS (darwin).
    *
@@ -1109,7 +1188,10 @@ export class ShellExecutionService {
         if (targetRealPath !== undefined) {
           try {
             const candidatePath = fs.realpathSync(`/dev/fd/${candidateFd}`);
-            if (candidatePath !== targetRealPath) {
+            if (
+              candidatePath !== targetRealPath &&
+              candidatePath !== `/dev/fd/${candidateFd}`
+            ) {
               continue;
             }
           } catch {
@@ -1215,6 +1297,7 @@ export class ShellExecutionService {
       const masterFd = (ptyProcess as unknown as { fd?: number }).fd;
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const ptsName = (ptyProcess as unknown as { ptsName?: string }).ptsName;
+      ShellExecutionService.closeOrphanMasterFd(masterFd);
       ShellExecutionService.closeOrphanSlaveFd(masterFd, ptsName);
 
       const agent = pty._agent;

@@ -39,6 +39,11 @@ const mockCreateWriteStream = vi.hoisted(() => vi.fn());
 const mockStatSync = vi.hoisted(() => vi.fn());
 const mockFstatSync = vi.hoisted(() => vi.fn());
 const mockCloseSync = vi.hoisted(() => vi.fn());
+const mockRealpathSync = vi.hoisted(() =>
+  vi.fn(() => {
+    throw new Error('ENOENT');
+  }),
+);
 const mockGetPty = vi.hoisted(() => vi.fn());
 const mockSerializeTerminalToObject = vi.hoisted(() => vi.fn());
 const mockResolveExecutable = vi.hoisted(() => vi.fn());
@@ -72,12 +77,14 @@ vi.mock('node:fs', async (importOriginal) => {
       statSync: mockStatSync,
       fstatSync: mockFstatSync,
       closeSync: mockCloseSync,
+      realpathSync: mockRealpathSync,
     },
     mkdirSync: mockMkdirSync,
     createWriteStream: mockCreateWriteStream,
     statSync: mockStatSync,
     fstatSync: mockFstatSync,
     closeSync: mockCloseSync,
+    realpathSync: mockRealpathSync,
   };
 });
 vi.mock('../utils/shell-utils.js', async (importOriginal) => {
@@ -1511,6 +1518,175 @@ describe('ShellExecutionService', () => {
       expect(destroySpy).toHaveBeenCalled();
       expect(ShellExecutionService['activePtys'].has(77777)).toBe(false);
       expect(pidReadCount).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Orphan PTY master FD cleanup', () => {
+    const closeOrphanMasterFd = (
+      masterFd: number | undefined,
+    ): number | undefined =>
+      (
+        ShellExecutionService as unknown as {
+          closeOrphanMasterFd: (fd: number | undefined) => number | undefined;
+        }
+      ).closeOrphanMasterFd(masterFd);
+
+    it('synchronously closes masterFd - 1 when platform is darwin and candidate matches ptmx character device', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+      const ptmxDev = 18446744073498618000;
+      const ptmxMajor = 15;
+      const masterRdev = (ptmxMajor << 24) | 100;
+      const candidateRdev = (ptmxMajor << 24) | 99;
+
+      mockFstatSync.mockImplementation((fd: number) => {
+        if (fd === 12) {
+          return {
+            dev: ptmxDev,
+            rdev: masterRdev,
+            isCharacterDevice: () => true,
+          };
+        }
+        if (fd === 11) {
+          return {
+            dev: ptmxDev,
+            rdev: candidateRdev,
+            isCharacterDevice: () => true,
+          };
+        }
+        return { dev: 0, rdev: 0, isCharacterDevice: () => false };
+      });
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBe(11);
+      expect(mockCloseSync).toHaveBeenCalledTimes(1);
+      expect(mockCloseSync).toHaveBeenCalledWith(11);
+    });
+
+    it('returns undefined on non-darwin platforms without probing fds', () => {
+      mockPlatform.mockReturnValue('linux');
+      mockFstatSync.mockClear();
+      mockCloseSync.mockClear();
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBeUndefined();
+      expect(mockFstatSync).not.toHaveBeenCalled();
+      expect(mockCloseSync).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined if masterFd <= 0 or invalid', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+
+      expect(closeOrphanMasterFd(0)).toBeUndefined();
+      expect(closeOrphanMasterFd(-1)).toBeUndefined();
+      expect(closeOrphanMasterFd(undefined)).toBeUndefined();
+      expect(mockCloseSync).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined if candidate fd is not a character device', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+      const ptmxDev = 1000;
+      const ptmxMajor = 15;
+      const masterRdev = (ptmxMajor << 24) | 100;
+
+      mockFstatSync.mockImplementation((fd: number) => {
+        if (fd === 12) {
+          return {
+            dev: ptmxDev,
+            rdev: masterRdev,
+            isCharacterDevice: () => true,
+          };
+        }
+        if (fd === 11) {
+          return {
+            dev: ptmxDev,
+            rdev: masterRdev,
+            isCharacterDevice: () => false,
+          };
+        }
+        return { dev: 0, rdev: 0, isCharacterDevice: () => false };
+      });
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBeUndefined();
+      expect(mockCloseSync).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined if candidate major device does not match ptmx major (15)', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+      const ptmxDev = 1000;
+
+      mockFstatSync.mockImplementation((fd: number) => {
+        if (fd === 12) {
+          return {
+            dev: ptmxDev,
+            rdev: (15 << 24) | 100,
+            isCharacterDevice: () => true,
+          };
+        }
+        if (fd === 11) {
+          return {
+            dev: ptmxDev,
+            rdev: (3 << 24) | 100, // e.g. /dev/null
+            isCharacterDevice: () => true,
+          };
+        }
+        return { dev: 0, rdev: 0, isCharacterDevice: () => false };
+      });
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBeUndefined();
+      expect(mockCloseSync).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined if candidate dev filesystem does not match master dev', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+
+      mockFstatSync.mockImplementation((fd: number) => {
+        if (fd === 12) {
+          return {
+            dev: 1000,
+            rdev: (15 << 24) | 100,
+            isCharacterDevice: () => true,
+          };
+        }
+        if (fd === 11) {
+          return {
+            dev: 2000, // Different filesystem
+            rdev: (15 << 24) | 99,
+            isCharacterDevice: () => true,
+          };
+        }
+        return { dev: 0, rdev: 0, isCharacterDevice: () => false };
+      });
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBeUndefined();
+      expect(mockCloseSync).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined if candidate rdev equals master rdev', () => {
+      mockPlatform.mockReturnValue('darwin');
+      mockCloseSync.mockClear();
+
+      mockFstatSync.mockImplementation((fd: number) => {
+        if (fd === 12 || fd === 11) {
+          return {
+            dev: 1000,
+            rdev: (15 << 24) | 100,
+            isCharacterDevice: () => true,
+          };
+        }
+        return { dev: 0, rdev: 0, isCharacterDevice: () => false };
+      });
+
+      const result = closeOrphanMasterFd(12);
+      expect(result).toBeUndefined();
+      expect(mockCloseSync).not.toHaveBeenCalled();
     });
   });
 
